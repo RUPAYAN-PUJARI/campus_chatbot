@@ -1,9 +1,11 @@
-"""Groq LLM service utilities (Llama)."""
+"""Groq LLM service utilities (GPT-OSS)."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
+from functools import lru_cache
 from typing import Any, Dict, List
 
 import requests
@@ -12,13 +14,63 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_TOKENS", "512"))
+GROQ_REASONING_EFFORT = os.getenv("GROQ_REASONING_EFFORT", "low").strip()
+
+
+PLAIN_TEXT_RULE = (
+    "Reply in plain conversational prose. Do not use any markdown formatting: "
+    "no asterisks for bold or italics, no bullet or numbered lists, no tables, "
+    "no headings, no backticks. Write any URLs bare. "
+    "Structured details are already shown to the user as cards below your reply, "
+    "so summarise rather than tabulating them."
+)
+
+_EMPHASIS_PATTERNS = (
+    (re.compile(r"\*\*(.+?)\*\*", re.DOTALL), r"\1"),
+    (re.compile(r"__(.+?)__", re.DOTALL), r"\1"),
+    (re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)"), r"\1"),
+    (re.compile(r"`([^`]+)`"), r"\1"),
+)
+_HEADING_RE = re.compile(r"^\s*#{1,6}\s*")
+_LINK_RE = re.compile(r"\[([^\]]+)\]\((\S+?)\)")
+_TABLE_SEPARATOR_RE = re.compile(r"^\|?[\s:|-]*-{3,}[\s:|-]*\|?$")
+_NARROW_SPACES = ("\u202f", "\u00a0", "\u2009", "\u2007")
 
 
 class GroqError(RuntimeError):
     pass
+
+
+def _unwrap_link(match: "re.Match[str]") -> str:
+    label, url = match.group(1).strip(), match.group(2).strip()
+    return url if label == url else f"{label}: {url}"
+
+
+def _plain_text(value: str) -> str:
+    if not isinstance(value, str):
+        return value
+
+    for char in _NARROW_SPACES:
+        value = value.replace(char, " ")
+
+    lines = []
+    for line in value.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("|") and _TABLE_SEPARATOR_RE.match(stripped):
+            continue
+        if stripped.startswith("|") and stripped.endswith("|"):
+            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+            line = " - ".join(cell for cell in cells if cell)
+        line = _HEADING_RE.sub("", line)
+        line = _LINK_RE.sub(_unwrap_link, line)
+        for pattern, repl in _EMPHASIS_PATTERNS:
+            line = pattern.sub(repl, line)
+        lines.append(line.rstrip())
+
+    return "\n".join(lines).strip()
 
 
 def _call_groq(
@@ -35,6 +87,8 @@ def _call_groq(
         "temperature": temperature,
         "max_tokens": max_tokens or GROQ_MAX_TOKENS,
     }
+    if GROQ_REASONING_EFFORT:
+        payload["reasoning_effort"] = GROQ_REASONING_EFFORT
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
@@ -74,6 +128,47 @@ def _match_department(prompt: str, departments: List[str]) -> str:
         if any(keyword in normalized_prompt for keyword in keywords):
             return canonical.title().replace("&", "&")
     return ""
+
+
+SCOPE_SYSTEM_PROMPT = (
+    "You are a scope classifier for the BPPIMT campus assistant. "
+    "BPPIMT is the B. P. Poddar Institute of Management and Technology, Kolkata. "
+    "Users also call it BPPIMT, BP Poddar, B P Poddar, B.P. Poddar, or simply Poddar; "
+    "treat any of these as referring to the institute. "
+    "The assistant can only answer questions about: "
+    "BPPIMT faculty (names, departments, designations, specialisation, experience, heads of department); "
+    "student placement records (employers, disciplines, years, on or off campus); "
+    "scholarship schemes (eligibility, income limits, providers, fee waivers); "
+    "and BPPIMT campus information taken from its website (admissions, courses, fees, "
+    "timetable and class routine, academic calendar, holiday lists, examination schedules, "
+    "results, notices, events, facilities, and contact details). "
+    "A message that is only a person's name is IN_SCOPE, because it may name a faculty member. "
+    "A question about holidays, term dates, or the academic calendar is IN_SCOPE even when it "
+    "does not name the institute, because the assistant only serves BPPIMT students. "
+    "Everything else is OUT_OF_SCOPE: general knowledge, films, sport, news, other institutions, "
+    "coding help, mathematics, translation, writing tasks, and open-ended chit-chat. "
+    "Reply with exactly one word: IN_SCOPE or OUT_OF_SCOPE."
+)
+
+
+@lru_cache(maxsize=512)
+def is_campus_query(prompt: str) -> bool:
+    """Whether the prompt is answerable from campus data.
+
+    Fails open: a Groq outage must not turn the assistant into a wall of refusals.
+    """
+    try:
+        verdict = _call_groq(
+            [
+                {"role": "system", "content": SCOPE_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            max_tokens=120,
+        )
+    except GroqError:
+        return True
+    return "OUT_OF_SCOPE" not in verdict.strip().upper()
 
 
 def parse_prompt_to_filters(prompt: str, departments: List[str], designations: List[str]) -> Dict[str, str]:
@@ -156,7 +251,7 @@ def generate_response(prompt: str, results: List[Dict[str, Any]]) -> str:
     system_prompt = (
         "You are a helpful faculty assistant. Use only the provided context. "
         "If context is provided, do NOT say you couldn't find a match. "
-        "Keep it concise."
+        "Keep it concise. " + PLAIN_TEXT_RULE
     )
     user_prompt = (
         f"User prompt: {prompt}\n"
@@ -172,6 +267,7 @@ def generate_response(prompt: str, results: List[Dict[str, Any]]) -> str:
         temperature=0.3,
         max_tokens=300,
     )
+    response = _plain_text(response)
     if results and isinstance(response, str):
         lowered = response.lower()
         if "couldn't find" in lowered or "no match" in lowered:
@@ -207,7 +303,7 @@ def generate_placement_response(
     system_prompt = (
         "You are a placements assistant. Respond with exactly one sentence that starts with "
         "'Here are the placement details' and includes the company list exactly as provided. "
-        "Do not add extra details."
+        "Do not add extra details. " + PLAIN_TEXT_RULE
     )
     user_prompt = f"Required response: {required_response}"
 
@@ -219,6 +315,7 @@ def generate_placement_response(
         temperature=0.0,
         max_tokens=160,
     )
+    response = _plain_text(response)
     if not isinstance(response, str) or "Here are the placement details" not in response:
         return required_response
     return response
@@ -246,7 +343,8 @@ def generate_scholarship_response(
 
     system_prompt = (
         "You are a helpful scholarship assistant. Use only the provided context lines and summary. "
-        "If no results, say you couldn't find matching scholarship schemes. Keep it concise and factual."
+        "If no results, say you couldn't find matching scholarship schemes. Keep it concise and factual. "
+        + PLAIN_TEXT_RULE
     )
     user_prompt = (
         f"User prompt: {prompt}\n"
@@ -254,13 +352,15 @@ def generate_scholarship_response(
         "Context:\n" + "\n".join(context_lines)
     )
 
-    return _call_groq(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.2,
-        max_tokens=280,
+    return _plain_text(
+        _call_groq(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=280,
+        )
     )
 
 
@@ -294,18 +394,20 @@ def generate_web_response(prompt: str, results: List[Dict[str, Any]]) -> str:
         "Use ONLY the provided context lines. "
         "Answer the user's question concisely and include relevant URLs. "
         "If the user asks about timetable/routine, include the PDF links if present. "
-        "If the answer is not in the context, say so explicitly."
+        "If the answer is not in the context, say so explicitly. " + PLAIN_TEXT_RULE
     )
     user_prompt = (
         f"User question: {prompt}\n"
         "Context:\n" + "\n".join(context_lines)
     )
 
-    return _call_groq(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.2,
-        max_tokens=320,
+    return _plain_text(
+        _call_groq(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=320,
+        )
     )

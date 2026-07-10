@@ -11,7 +11,7 @@ An AI-powered campus assistant for **BP Poddar Institute of Management & Technol
 - **Placement Records** — query 900+ placement records by company, discipline, year, or student name; paginated results
 - **Scholarship Discovery** — find matching schemes by eligibility, state, income, and target group
 - **Campus Web Q&A** — answers sourced from scraped BPPIMT website content (admissions, timetable, facilities)
-- **LLM-Powered Responses** — Groq Llama-3.1-8b-instant generates natural language answers from retrieved context
+- **LLM-Powered Responses** — Groq GPT-OSS-20B generates natural language answers from retrieved context
 
 ---
 
@@ -23,7 +23,7 @@ An AI-powered campus assistant for **BP Poddar Institute of Management & Technol
 | Vector Search | FAISS (IndexFlatIP) |
 | Text Embeddings | sentence-transformers (`all-MiniLM-L6-v2`, 384-dim) |
 | Face Embeddings | FaceNet-PyTorch (MTCNN + InceptionResnetV1, 512-dim) |
-| LLM | Groq API — Llama-3.1-8b-instant |
+| LLM | Groq API — GPT-OSS-20B (`openai/gpt-oss-20b`) |
 | Web Scraping | BeautifulSoup4 |
 | Frontend | React 18 (CDN, no build step), custom CSS |
 | Image Processing | Pillow |
@@ -37,7 +37,7 @@ An AI-powered campus assistant for **BP Poddar Institute of Management & Technol
 campus_chatbot/
 ├── main.py                           # CLI: build indexes, run CLI search
 ├── requirements.txt
-├── .env                              # GROQ_API_KEY, GROQ_MODEL
+├── .env                              # GROQ_API_KEY, GROQ_MODEL, GROQ_REASONING_EFFORT
 
 ├── backend/
 │   ├── app.py                        # Flask server — routes, intent detection, orchestration
@@ -103,7 +103,8 @@ Create a `.env` file in the project root:
 
 ```env
 GROQ_API_KEY=your_groq_api_key_here
-GROQ_MODEL=llama-3.1-8b-instant
+GROQ_MODEL=openai/gpt-oss-20b
+GROQ_REASONING_EFFORT=low
 ```
 
 ### 3. Build FAISS indexes (one-time)

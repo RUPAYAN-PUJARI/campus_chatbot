@@ -37,6 +37,7 @@ from backend.services.llm_service import (
     generate_response,
     generate_scholarship_response,
     generate_web_response,
+    is_campus_query,
     parse_prompt_to_filters,
 )
 
@@ -48,6 +49,66 @@ PLACEMENT_DOCS_PATH = ROOT / "processed" / "placement_documents.json"
 SCHOLARSHIP_DOCS_PATH = ROOT / "processed" / "scholarship_documents.json"
 PLACEMENT_INDEX_PATH = ROOT / "vector_db" / "faiss_placement.index"
 SCHOLARSHIP_INDEX_PATH = ROOT / "vector_db" / "faiss_scholarship.index"
+
+CAPABILITIES_ANSWER = (
+    "Hi! I'm the BPPIMT Campus Assistant. I can help you with:\n"
+    "- Faculty — search by name, department, or designation\n"
+    "- Placements — records by company, discipline, or year\n"
+    "- Scholarships — find schemes by eligibility\n"
+    "- Campus info — admissions, courses, facilities, and more\n\n"
+    "What would you like to know?"
+)
+OUT_OF_SCOPE_ANSWER = (
+    "I can only answer questions about BPPIMT. Here's what I can help with:\n"
+    "- Faculty — search by name, department, or designation\n"
+    "- Placements — records by company, discipline, or year\n"
+    "- Scholarships — find schemes by eligibility\n"
+    "- Campus info — admissions, courses, facilities, and more"
+)
+
+# Any of these makes a prompt obviously on-topic, so it skips the classifier call.
+DOMAIN_KEYWORDS = frozenset(
+    {
+        "faculty", "faculties", "teacher", "teachers", "staff", "professor", "professors",
+        "lecturer", "hod", "department", "departments", "designation", "specialization",
+        "specialisation", "qualification", "experience",
+        "placement", "placements", "placed", "recruiter", "employer", "internship",
+        "scholarship", "scholarships", "scheme", "schemes", "stipend", "freeship", "waiver",
+        "admission", "admissions", "syllabus", "curriculum", "timetable", "routine",
+        "semester", "exam", "exams", "fees", "hostel", "campus", "college", "institute",
+        "bppimt", "poddar", "btech", "mba", "mca",
+    }
+)
+
+# Surnames and corporate suffixes too generic to prove a prompt is on-topic.
+GENERIC_ENTITY_TOKENS = frozenset(
+    {
+        "dr", "mr", "mrs", "ms", "prof", "the", "and", "for", "ltd", "limited", "pvt",
+        "private", "inc", "llp", "india", "indian", "technologies", "technology",
+        "solutions", "services", "systems", "consultancy", "global", "digital", "group",
+        "engineering", "science", "sciences", "computer", "information", "applied",
+    }
+)
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _tokenize(text: str) -> set[str]:
+    return set(_TOKEN_RE.findall((text or "").lower()))
+
+
+def _build_entity_tokens(
+    faculty_docs: list[Dict[str, Any]],
+    placement_records: list[Dict[str, str]],
+) -> set[str]:
+    tokens: set[str] = set()
+    for doc in faculty_docs:
+        for field in ("name", "department", "present_designation"):
+            tokens |= _tokenize(str(doc.get(field) or ""))
+    for record in placement_records:
+        tokens |= _tokenize(record.get("employer") or "")
+        tokens |= _tokenize(record.get("discipline") or "")
+    return {tok for tok in tokens if len(tok) >= 3 and tok not in GENERIC_ENTITY_TOKENS}
 
 
 def create_app() -> Flask:
@@ -94,6 +155,14 @@ def create_app() -> Flask:
     if scholarships_path.exists():
         with scholarships_path.open("r", encoding="utf-8") as handle:
             scholarship_records = json.load(handle)
+
+    entity_tokens = _build_entity_tokens(documents, placement_records)
+
+    def _is_in_scope(prompt_text: str) -> bool:
+        prompt_tokens = _tokenize(prompt_text)
+        if prompt_tokens & DOMAIN_KEYWORDS or prompt_tokens & entity_tokens:
+            return True
+        return is_campus_query(prompt_text.strip())
 
     face_documents = load_face_documents(ROOT / "processed" / "faculty_documents.json")
     face_index = None
@@ -955,14 +1024,16 @@ def create_app() -> Flask:
             _prompt_clean = re.sub(r"[!.,?]+$", "", prompt.lower().strip())
             if _prompt_clean in _greetings:
                 return jsonify({
-                    "answer": (
-                        "Hi! I'm the BPPIMT Campus Assistant. I can help you with:\n"
-                        "- Faculty — search by name, department, or designation\n"
-                        "- Placements — records by company, discipline, or year\n"
-                        "- Scholarships — find schemes by eligibility\n"
-                        "- Campus info — admissions, courses, facilities, and more\n\n"
-                        "What would you like to know?"
-                    ),
+                    "answer": CAPABILITIES_ANSWER,
+                    "results": [],
+                    "filters": {},
+                })
+
+            # Runs before intent routing: "list all dinosaurs" would otherwise match
+            # list_intent on "all" and return the whole faculty directory.
+            if not _is_in_scope(prompt):
+                return jsonify({
+                    "answer": OUT_OF_SCOPE_ANSWER,
                     "results": [],
                     "filters": {},
                 })
